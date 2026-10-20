@@ -1,0 +1,49 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# AWS credentials and configuration
+.aws/
+**/.aws/
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node.js
+node_modules/
+
+# Logs
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Terraform state
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# CloudFormation / SAM artifacts
+.packaged.yaml
+.packaged.yml
+.sam/
+.aws-sam/
+
+# Temporary files
+*.tmp
+*.swp
+*~
