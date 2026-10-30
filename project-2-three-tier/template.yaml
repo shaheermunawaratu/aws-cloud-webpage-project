@@ -672,6 +672,13 @@ Resources:
         - Key: Tier
           Value: Database
 
+  DatabaseCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/database/credentials'
+      Description: Credentials for the three-tier lab MySQL database
+      SecretString: !Sub '{"username":"${DbMasterUsername}","password":"${DbMasterPassword}"}'
+
   AppInstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -728,6 +735,65 @@ Resources:
       Path: /
       Roles:
         - !Ref AppInstanceRole
+
+  DatabaseAppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      Policies:
+        - PolicyName: SSMCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+
+        - PolicyName: ReadDatabaseCredentials
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseCredentialsSecret
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-database-app-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+          
+  DatabaseAppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref DatabaseAppInstanceRole
 
   InternalAppLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
@@ -802,7 +868,7 @@ Resources:
         ImageId: !Ref LatestAmiId
         InstanceType: !Ref AppInstanceType
         IamInstanceProfile:
-          Name: !Ref AppInstanceProfile
+          Name: !Ref DatabaseAppInstanceProfile
         MetadataOptions:
           HttpEndpoint: enabled
           HttpTokens: required
@@ -824,48 +890,129 @@ Resources:
           Fn::Base64: !Sub |
             #!/bin/bash
             set -euxo pipefail
-            dnf install -y python3
+
+            dnf install -y python3 python3-pip
+            python3 -m venv /opt/demo-app-venv
+            /opt/demo-app-venv/bin/pip install --no-cache-dir boto3 PyMySQL
+
             cat > /opt/demo-app.py <<'PY'
             from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
             import json
+            import os
             import socket
-            APP_PORT = ${AppPort}
+            import boto3
+            import pymysql
+
+            APP_PORT = int(os.environ["APP_PORT"])
+
+            def get_db_credentials():
+                client = boto3.client(
+                    "secretsmanager",
+                    region_name=os.environ["AWS_REGION"]
+                )
+                response = client.get_secret_value(
+                    SecretId=os.environ["DB_SECRET_ARN"]
+                )
+                return json.loads(response["SecretString"])
+
             class DemoHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    if self.path not in ("/", "/health"):
-                        self.send_error(404)
-                        return
-                    body = json.dumps({
-                        "service": "three-tier-demo-app",
-                        "status": "ok",
-                        "hostname": socket.gethostname()
-                    }).encode("utf-8")
-                    self.send_response(200)
+
+                def send_json(self, status_code, data):
+                    body = json.dumps(data).encode("utf-8")
+                    self.send_response(status_code)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
-            ThreadingHTTPServer(("0.0.0.0", APP_PORT), DemoHandler).serve_forever()
+
+                def do_GET(self):
+
+                    if self.path in ("/", "/health"):
+                        self.send_json(200, {
+                            "service": "three-tier-demo-app",
+                            "status": "ok",
+                            "hostname": socket.gethostname()
+                        })
+                        return
+
+                    if self.path == "/db-health":
+                        connection = None
+
+                        try:
+                            credentials = get_db_credentials()
+
+                            connection = pymysql.connect(
+                                host=os.environ["DB_HOST"],
+                                user=credentials["username"],
+                                password=credentials["password"],
+                                database=os.environ["DB_NAME"],
+                                port=int(os.environ.get("DB_PORT", "3306")),
+                                connect_timeout=5,
+                                read_timeout=5,
+                                write_timeout=5
+                            )
+
+                            with connection.cursor() as cursor:
+                                cursor.execute("SELECT 1")
+                                cursor.fetchone()
+
+                            self.send_json(200, {
+                                "service": "three-tier-demo-app",
+                                "database": "connected"
+                            })
+
+                        except Exception as exc:
+                            print(
+                                "Database check failed: " + type(exc).__name__,
+                                flush=True
+                            )
+                            self.send_json(503, {
+                                "service": "three-tier-demo-app",
+                                "database": "unavailable"
+                            })
+
+                        finally:
+                            if connection is not None:
+                                connection.close()
+
+                        return
+
+                    self.send_error(404)
+
+            ThreadingHTTPServer(
+                ("0.0.0.0", APP_PORT),
+                DemoHandler
+            ).serve_forever()
             PY
+
             cat > /etc/systemd/system/demo-app.service <<'UNIT'
             [Unit]
             Description=Three-tier lab demo JSON application
             After=network-online.target
             Wants=network-online.target
+
             [Service]
             Type=simple
             User=nobody
             Group=nobody
-            ExecStart=/usr/bin/python3 /opt/demo-app.py
+            Environment=APP_PORT=${AppPort}
+            Environment=DB_HOST=${DatabaseInstance.Endpoint.Address}
+            Environment=DB_PORT=3306
+            Environment=DB_NAME=${DbName}
+            Environment=DB_SECRET_ARN=${DatabaseCredentialsSecret}
+            Environment=AWS_REGION=${AWS::Region}
+            ExecStart=/opt/demo-app-venv/bin/python /opt/demo-app.py
             Restart=always
             RestartSec=5
             NoNewPrivileges=true
             PrivateTmp=true
             ProtectSystem=strict
             ProtectHome=true
+
             [Install]
             WantedBy=multi-user.target
             UNIT
+
             systemctl daemon-reload
             systemctl enable --now demo-app
             systemctl enable --now amazon-ssm-agent
@@ -921,6 +1068,14 @@ Resources:
         - Key: Tier
           Value: App
           PropagateAtLaunch: true
+
+    UpdatePolicy:
+      AutoScalingInstanceRefresh:
+        Preferences:
+          MinHealthyPercentage: 100
+          MaxHealthyPercentage: 150
+          InstanceWarmup: 300
+          SkipMatching: true
 
   AppCpuScalingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
