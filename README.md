@@ -1,5 +1,8 @@
 # aws-cloud-webpage-project
 Created seperate folders for each task.
+
+Task 1:
+
 Used chatgpt to get a plan for the workflow using this command;
 I'm doing a CloudFormation lab for uni, I have to build two things in AWS using YAML templates, first a static website. the HTML/CSS lives in an S3 bucket and gets served publicly, I'm thinking CloudFront with the bucket kept private. the page header has to say my L number and my name, that's part of the marking. 2nd a separate 3 tier setup with a web tier, app tier and database tier. so a VPC, public/private/isolated subnets across two AZs, a load balancer, auto scaling groups and RDS. I want to create the folders project-1-static-website/website and project-2-three-tier, with a .gitkeep in each so git keeps them, and add a .gitignore that suits AWS work (keep .env, .pem files, .aws/ and .DS_Store out). just create or edit files
 
@@ -26,3 +29,7 @@ Checked that the bucket is private and secure;
 
 
 
+Task 2:
+Chatgpt command:
+"I am starting the second part of the lab and I already have the folder named as project 2-three-tier so now I want you to create the template.yaml file with just the network stuff my region is eu-north-I want a VPC uh an Internet gateway and two availability zones use get AZs and select, don't hardcore the zone names. *In each zone* I need a public subnet for the webtier, a private one for the app tier and isolated one for the database. public goes to the Internet gateway private goes out through an isolated gets no Internet at all. NAT cost money so add a parameter where I can pick one Nat or one per zone. put the cidrs and environment name in parameter tag everything properly and output the VPC ID and subnet IDs add a comment above each resourcing why it's there then run cfn-lint and fix anything it moans about just edit the files please no get or no commands I'll do that myself"
+First I designed and deployed a web-tier network on AWS using CloudFormation and AWS CLI in the eu-north-1 region. The infrastructure includes a VPC with six subnets across two Availability Zones, separating the web, application and database tiers. I configured an Internet Gateway, NAT Gateway and route tables, with a parameter to choose between one NAT Gateway or one per Availability Zone. I also removed the stack after testing to avoid unnecessary AWS charges.

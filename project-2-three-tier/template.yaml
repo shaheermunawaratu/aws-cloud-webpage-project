@@ -1,0 +1,460 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Network foundation for the three-tier lab: two AZs, public web subnets,
+  private application subnets, isolated database subnets, and configurable NAT.
+  Deploy this stack in eu-north-1 (Stockholm).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment prefix used for resource names and tags.
+    AllowedPattern: '^[a-z][a-z0-9-]{0,19}$'
+    ConstraintDescription: Use 1-20 lowercase letters, numbers, or hyphens; start with a letter.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: IPv4 CIDR for the whole VPC; must contain all six subnet CIDRs.
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: Public web subnet in the first selected Availability Zone.
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Public web subnet in the second selected Availability Zone.
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.10.0/24
+    Description: Private app subnet in the first selected Availability Zone.
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: Private app subnet in the second selected Availability Zone.
+  IsolatedSubnet1Cidr:
+    Type: String
+    Default: 10.0.20.0/24
+    Description: Isolated database subnet in the first selected Availability Zone.
+  IsolatedSubnet2Cidr:
+    Type: String
+    Default: 10.0.21.0/24
+    Description: Isolated database subnet in the second selected Availability Zone.
+
+  NatGatewayMode:
+    Type: String
+    Default: Single
+    AllowedValues:
+      - Single
+      - PerAZ
+    Description: >-
+      Single uses one NAT gateway in AZ 1 for both app subnets (lower cost,
+      cross-AZ dependency); PerAZ creates one NAT gateway in each AZ.
+
+Conditions:
+  UseNatPerAZ: !Equals [!Ref NatGatewayMode, PerAZ]
+
+Resources:
+  # Create an isolated network boundary for all three application tiers.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-three-tier-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Shared
+
+  # Provide a gateway for internet traffic originating from the public tier.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Public
+
+  # Attach the internet gateway to the VPC so public routing is possible.
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Allocate the web/public subnet in the first dynamically selected AZ.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-web-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  # Allocate a second web/public subnet in another AZ for high availability.
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-web-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  # Allocate a private app subnet in AZ 1; no public IPs on launch.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-app-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  # Allocate a private app subnet in AZ 2; it will use NAT for outbound access.
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-app-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  # Allocate an isolated database subnet in AZ 1 with no internet route.
+  IsolatedSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref IsolatedSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-db-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  # Allocate an isolated database subnet in AZ 2 for a future RDS subnet group.
+  IsolatedSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref IsolatedSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-db-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  # Define a shared public route table for both public web subnets.
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  # Route public subnet internet traffic through the attached internet gateway.
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate the AZ 1 public subnet with the public route table.
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Associate the AZ 2 public subnet with the same public route table.
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Reserve a public Elastic IP address for the NAT gateway in AZ 1.
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-eip-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: AppEgress
+
+  # Create the primary public NAT gateway for app-tier outbound connectivity.
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicDefaultRoute
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: AppEgress
+
+  # Reserve a second NAT Elastic IP only when one NAT per AZ is requested.
+  NatEip2:
+    Type: AWS::EC2::EIP
+    Condition: UseNatPerAZ
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-eip-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: AppEgress
+
+  # Create the AZ 2 NAT gateway only in PerAZ mode for AZ-local egress.
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: UseNatPerAZ
+    DependsOn: PublicDefaultRoute
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: AppEgress
+
+  # Give the app subnet in AZ 1 its own private route table.
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-app-rt-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  # Direct AZ 1 app subnet's outbound IPv4 traffic through NAT 1.
+  PrivateDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  # Associate the AZ 1 application subnet with its private route table.
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  # Give the app subnet in AZ 2 an independent private route table.
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-app-rt-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  # Use NAT 1 for AZ 2 in Single mode or its local NAT 2 in PerAZ mode.
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [UseNatPerAZ, !Ref NatGateway2, !Ref NatGateway1]
+
+  # Associate the AZ 2 application subnet with its private route table.
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # Create a database route table in AZ 1 containing only the implicit local route.
+  IsolatedRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-db-rt-az1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  # Associate the AZ 1 database subnet with its no-internet route table.
+  IsolatedSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnet1
+      RouteTableId: !Ref IsolatedRouteTable1
+
+  # Create a second database route table without an internet or NAT route.
+  IsolatedRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-isolated-db-rt-az2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  # Associate the AZ 2 database subnet with the isolated AZ 2 route table.
+  IsolatedSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref IsolatedSubnet2
+      RouteTableId: !Ref IsolatedRouteTable2
+
+Outputs:
+  VpcId:
+    Description: VPC ID for the three-tier architecture.
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnet1Id:
+    Description: Web-tier public subnet ID in the first selected AZ.
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Description: Web-tier public subnet ID in the second selected AZ.
+    Value: !Ref PublicSubnet2
+  PrivateSubnet1Id:
+    Description: App-tier private subnet ID in the first selected AZ.
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Description: App-tier private subnet ID in the second selected AZ.
+    Value: !Ref PrivateSubnet2
+  IsolatedSubnet1Id:
+    Description: Database-tier isolated subnet ID in the first selected AZ.
+    Value: !Ref IsolatedSubnet1
+  IsolatedSubnet2Id:
+    Description: Database-tier isolated subnet ID in the second selected AZ.
+    Value: !Ref IsolatedSubnet2
+
+  PublicSubnetIds:
+    Description: Comma-separated public subnet IDs for a future web load balancer.
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+  PrivateSubnetIds:
+    Description: Comma-separated private subnet IDs for future application instances.
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+  IsolatedSubnetIds:
+    Description: Comma-separated isolated subnet IDs for a future RDS subnet group.
+    Value: !Join [',', [!Ref IsolatedSubnet1, !Ref IsolatedSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-IsolatedSubnetIds'
+  NatMode:
+    Description: Selected NAT gateway architecture.
+    Value: !Ref NatGatewayMode
