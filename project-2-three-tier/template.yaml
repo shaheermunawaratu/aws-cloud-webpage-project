@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  Network foundation for the three-tier lab: two AZs, public web subnets,
-  private application subnets, isolated database subnets, and configurable NAT.
+  Three-tier lab infrastructure: internet-facing web tier, private application
+  tier behind an internal load balancer, and an isolated Amazon RDS MySQL database.
   Deploy this stack in eu-north-1 (Stockholm).
 
 Parameters:
@@ -21,22 +21,27 @@ Parameters:
     Type: String
     Default: 10.0.0.0/24
     Description: Public web subnet in the first selected Availability Zone.
+
   PublicSubnet2Cidr:
     Type: String
     Default: 10.0.1.0/24
     Description: Public web subnet in the second selected Availability Zone.
+
   PrivateSubnet1Cidr:
     Type: String
     Default: 10.0.10.0/24
     Description: Private app subnet in the first selected Availability Zone.
+
   PrivateSubnet2Cidr:
     Type: String
     Default: 10.0.11.0/24
     Description: Private app subnet in the second selected Availability Zone.
+
   IsolatedSubnet1Cidr:
     Type: String
     Default: 10.0.20.0/24
     Description: Isolated database subnet in the first selected Availability Zone.
+
   IsolatedSubnet2Cidr:
     Type: String
     Default: 10.0.21.0/24
@@ -52,11 +57,119 @@ Parameters:
       Single uses one NAT gateway in AZ 1 for both app subnets (lower cost,
       cross-AZ dependency); PerAZ creates one NAT gateway in each AZ.
 
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI for the app instances.
+
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type used by the application Auto Scaling Group.
+
+  AppPort:
+    Type: Number
+    Default: 8000
+    MinValue: 1024
+    MaxValue: 65535
+    Description: TCP port used by the private demo application.
+
+  AppMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of application instances in the Auto Scaling Group.
+
+  AppDesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Initial desired number of application instances.
+
+  AppMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of application instances in the Auto Scaling Group.
+
+  AppCpuTargetUtilization:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 90
+    Description: Target average CPU utilisation percentage for app-tier scaling.
+
+  WebMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of web instances in the Auto Scaling Group.
+
+  WebDesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Initial desired number of web instances.
+
+  WebMaxSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of web instances in the Auto Scaling Group.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+    Description: RDS MySQL instance class.
+
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+    Description: Allocated database storage in GiB.
+
+  DbName:
+    Type: String
+    Default: threetierdb
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9]*$'
+    Description: Initial MySQL database name.
+
+  DbMasterUsername:
+    Type: String
+    Default: dbadmin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9]*$'
+    Description: Initial MySQL master username.
+
+  DbMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    MaxLength: 41
+    AllowedPattern: '^[A-Za-z0-9]+$'
+    ConstraintDescription: Use 16-41 letters and numbers only.
+    Description: MySQL master password; use a unique strong alphanumeric password.
+
 Conditions:
   UseNatPerAZ: !Equals [!Ref NatGatewayMode, PerAZ]
 
 Resources:
-  # Create an isolated network boundary for all three application tiers.
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -73,7 +186,6 @@ Resources:
         - Key: Tier
           Value: Shared
 
-  # Provide a gateway for internet traffic originating from the public tier.
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
@@ -87,14 +199,12 @@ Resources:
         - Key: Tier
           Value: Public
 
-  # Attach the internet gateway to the VPC so public routing is possible.
   InternetGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  # Allocate the web/public subnet in the first dynamically selected AZ.
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -112,7 +222,6 @@ Resources:
         - Key: Tier
           Value: Web
 
-  # Allocate a second web/public subnet in another AZ for high availability.
   PublicSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
@@ -130,7 +239,6 @@ Resources:
         - Key: Tier
           Value: Web
 
-  # Allocate a private app subnet in AZ 1; no public IPs on launch.
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -148,7 +256,6 @@ Resources:
         - Key: Tier
           Value: App
 
-  # Allocate a private app subnet in AZ 2; it will use NAT for outbound access.
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
@@ -166,7 +273,6 @@ Resources:
         - Key: Tier
           Value: App
 
-  # Allocate an isolated database subnet in AZ 1 with no internet route.
   IsolatedSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
@@ -184,7 +290,6 @@ Resources:
         - Key: Tier
           Value: Database
 
-  # Allocate an isolated database subnet in AZ 2 for a future RDS subnet group.
   IsolatedSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
@@ -202,7 +307,6 @@ Resources:
         - Key: Tier
           Value: Database
 
-  # Define a shared public route table for both public web subnets.
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -217,7 +321,6 @@ Resources:
         - Key: Tier
           Value: Web
 
-  # Route public subnet internet traffic through the attached internet gateway.
   PublicDefaultRoute:
     Type: AWS::EC2::Route
     DependsOn: InternetGatewayAttachment
@@ -226,21 +329,18 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  # Associate the AZ 1 public subnet with the public route table.
   PublicSubnet1RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet1
       RouteTableId: !Ref PublicRouteTable
 
-  # Associate the AZ 2 public subnet with the same public route table.
   PublicSubnet2RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  # Reserve a public Elastic IP address for the NAT gateway in AZ 1.
   NatEip1:
     Type: AWS::EC2::EIP
     DependsOn: InternetGatewayAttachment
@@ -256,7 +356,6 @@ Resources:
         - Key: Tier
           Value: AppEgress
 
-  # Create the primary public NAT gateway for app-tier outbound connectivity.
   NatGateway1:
     Type: AWS::EC2::NatGateway
     DependsOn: PublicDefaultRoute
@@ -274,7 +373,6 @@ Resources:
         - Key: Tier
           Value: AppEgress
 
-  # Reserve a second NAT Elastic IP only when one NAT per AZ is requested.
   NatEip2:
     Type: AWS::EC2::EIP
     Condition: UseNatPerAZ
@@ -291,7 +389,6 @@ Resources:
         - Key: Tier
           Value: AppEgress
 
-  # Create the AZ 2 NAT gateway only in PerAZ mode for AZ-local egress.
   NatGateway2:
     Type: AWS::EC2::NatGateway
     Condition: UseNatPerAZ
@@ -310,7 +407,6 @@ Resources:
         - Key: Tier
           Value: AppEgress
 
-  # Give the app subnet in AZ 1 its own private route table.
   PrivateRouteTable1:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -325,7 +421,6 @@ Resources:
         - Key: Tier
           Value: App
 
-  # Direct AZ 1 app subnet's outbound IPv4 traffic through NAT 1.
   PrivateDefaultRoute1:
     Type: AWS::EC2::Route
     Properties:
@@ -333,14 +428,12 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NatGateway1
 
-  # Associate the AZ 1 application subnet with its private route table.
   PrivateSubnet1RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet1
       RouteTableId: !Ref PrivateRouteTable1
 
-  # Give the app subnet in AZ 2 an independent private route table.
   PrivateRouteTable2:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -355,7 +448,6 @@ Resources:
         - Key: Tier
           Value: App
 
-  # Use NAT 1 for AZ 2 in Single mode or its local NAT 2 in PerAZ mode.
   PrivateDefaultRoute2:
     Type: AWS::EC2::Route
     Properties:
@@ -363,14 +455,12 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !If [UseNatPerAZ, !Ref NatGateway2, !Ref NatGateway1]
 
-  # Associate the AZ 2 application subnet with its private route table.
   PrivateSubnet2RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable2
 
-  # Create a database route table in AZ 1 containing only the implicit local route.
   IsolatedRouteTable1:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -385,14 +475,12 @@ Resources:
         - Key: Tier
           Value: Database
 
-  # Associate the AZ 1 database subnet with its no-internet route table.
   IsolatedSubnet1RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref IsolatedSubnet1
       RouteTableId: !Ref IsolatedRouteTable1
 
-  # Create a second database route table without an internet or NAT route.
   IsolatedRouteTable2:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -407,12 +495,613 @@ Resources:
         - Key: Tier
           Value: Database
 
-  # Associate the AZ 2 database subnet with the isolated AZ 2 route table.
   IsolatedSubnet2RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref IsolatedSubnet2
       RouteTableId: !Ref IsolatedRouteTable2
+
+  WebLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentName} public web load balancer security group.'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow public HTTP traffic to the web load balancer.
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-web-alb-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  WebTierSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentName} web instances; accept traffic only from the web ALB.'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow HTTP from the internet-facing web load balancer only.
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt WebLoadBalancerSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-web-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  AppLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentName} internal app load balancer; web tier only.'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow the app listener only from instances using WebTierSecurityGroup.
+          IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !GetAtt WebTierSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-alb-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  AppInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentName} app instances; accept traffic only from the internal app ALB.'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow the demo app port only from the internal load balancer security group.
+          IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !GetAtt AppLoadBalancerSecurityGroup.GroupId
+      SecurityGroupEgress:
+        - Description: Allow outbound HTTPS through the NAT gateway for SSM and package access.
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-instance-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${EnvironmentName} database; accept MySQL only from the app tier.'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow MySQL from application instances only.
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt AppInstanceSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-database-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  AppToDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow application instances to connect to MySQL in the database tier.
+      GroupId: !GetAtt AppInstanceSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !GetAtt DatabaseSecurityGroup.GroupId
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${EnvironmentName} isolated database subnets.'
+      SubnetIds:
+        - !Ref IsolatedSubnet1
+        - !Ref IsolatedSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-database-subnet-group'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      MasterUserPassword: !Ref DbMasterPassword
+      Port: 3306
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-mysql-database'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Database
+
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${EnvironmentName}-app-ssm-session-manager'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: RegisterManagedInstance
+                Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                Resource: '*'
+              - Sid: SessionManagerChannels
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+              - Sid: SsmAgentMessageFallback
+                Effect: Allow
+                Action:
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-instance-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AppInstanceRole
+
+  InternalAppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-app-alb'
+      Scheme: internal
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !GetAtt AppLoadBalancerSecurityGroup.GroupId
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-internal-app-alb'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: instance
+      Protocol: HTTP
+      Port: !Ref AppPort
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '15'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-targets'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: App
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalAppLoadBalancer
+      Port: !Ref AppPort
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${EnvironmentName}-app-launch-template'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile:
+          Name: !Ref AppInstanceProfile
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            DeleteOnTermination: true
+            Groups:
+              - !GetAtt AppInstanceSecurityGroup.GroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y python3
+            cat > /opt/demo-app.py <<'PY'
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            import json
+            import socket
+            APP_PORT = ${AppPort}
+            class DemoHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path not in ("/", "/health"):
+                        self.send_error(404)
+                        return
+                    body = json.dumps({
+                        "service": "three-tier-demo-app",
+                        "status": "ok",
+                        "hostname": socket.gethostname()
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+            ThreadingHTTPServer(("0.0.0.0", APP_PORT), DemoHandler).serve_forever()
+            PY
+            cat > /etc/systemd/system/demo-app.service <<'UNIT'
+            [Unit]
+            Description=Three-tier lab demo JSON application
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            Type=simple
+            User=nobody
+            Group=nobody
+            ExecStart=/usr/bin/python3 /opt/demo-app.py
+            Restart=always
+            RestartSec=5
+            NoNewPrivileges=true
+            PrivateTmp=true
+            ProtectSystem=strict
+            ProtectHome=true
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now demo-app
+            systemctl enable --now amazon-ssm-agent
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-app-instance'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: three-tier-lab
+              - Key: Tier
+                Value: App
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-app-volume'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: three-tier-lab
+              - Key: Tier
+                Value: App
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: AppListener
+    Properties:
+      MinSize: !Ref AppMinSize
+      DesiredCapacity: !Ref AppDesiredCapacity
+      MaxSize: !Ref AppMaxSize
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app-instance'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: three-tier-lab
+          PropagateAtLaunch: true
+        - Key: Tier
+          Value: App
+          PropagateAtLaunch: true
+
+  AppCpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 180
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref AppCpuTargetUtilization
+
+  WebLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnet1RouteTableAssociation
+      - PublicSubnet2RouteTableAssociation
+    Properties:
+      Name: !Sub '${EnvironmentName}-web-alb'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !GetAtt WebLoadBalancerSecurityGroup.GroupId
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-web-alb'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: instance
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-web-targets'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: three-tier-lab
+        - Key: Tier
+          Value: Web
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${EnvironmentName}-web-launch-template'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile:
+          Name: !Ref AppInstanceProfile
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            Groups:
+              - !GetAtt WebTierSecurityGroup.GroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y nginx
+            rm -f /etc/nginx/conf.d/default.conf
+            cat > /etc/nginx/conf.d/three-tier-proxy.conf <<'NGINX'
+            server {
+                listen 80;
+                server_name _;
+                location = /health {
+                    proxy_pass http://${InternalAppLoadBalancer.DNSName}:${AppPort}/health;
+                }
+                location / {
+                    proxy_pass http://${InternalAppLoadBalancer.DNSName}:${AppPort};
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                }
+            }
+            NGINX
+            nginx -t
+            systemctl enable --now nginx
+            systemctl enable --now amazon-ssm-agent
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-web-instance'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: three-tier-lab
+              - Key: Tier
+                Value: Web
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-web-volume'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: three-tier-lab
+              - Key: Tier
+                Value: Web
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: WebListener
+    Properties:
+      MinSize: !Ref WebMinSize
+      DesiredCapacity: !Ref WebDesiredCapacity
+      MaxSize: !Ref WebMaxSize
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-web-instance'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: three-tier-lab
+          PropagateAtLaunch: true
+        - Key: Tier
+          Value: Web
+          PropagateAtLaunch: true
 
 Outputs:
   VpcId:
@@ -424,37 +1113,99 @@ Outputs:
   PublicSubnet1Id:
     Description: Web-tier public subnet ID in the first selected AZ.
     Value: !Ref PublicSubnet1
+
   PublicSubnet2Id:
     Description: Web-tier public subnet ID in the second selected AZ.
     Value: !Ref PublicSubnet2
+
   PrivateSubnet1Id:
     Description: App-tier private subnet ID in the first selected AZ.
     Value: !Ref PrivateSubnet1
+
   PrivateSubnet2Id:
     Description: App-tier private subnet ID in the second selected AZ.
     Value: !Ref PrivateSubnet2
+
   IsolatedSubnet1Id:
     Description: Database-tier isolated subnet ID in the first selected AZ.
     Value: !Ref IsolatedSubnet1
+
   IsolatedSubnet2Id:
     Description: Database-tier isolated subnet ID in the second selected AZ.
     Value: !Ref IsolatedSubnet2
 
   PublicSubnetIds:
-    Description: Comma-separated public subnet IDs for a future web load balancer.
+    Description: Comma-separated public subnet IDs used by the public web load balancer.
     Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
     Export:
       Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+
   PrivateSubnetIds:
     Description: Comma-separated private subnet IDs for future application instances.
     Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
     Export:
       Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
   IsolatedSubnetIds:
-    Description: Comma-separated isolated subnet IDs for a future RDS subnet group.
+    Description: Comma-separated isolated subnet IDs used by the RDS database subnet group.
     Value: !Join [',', [!Ref IsolatedSubnet1, !Ref IsolatedSubnet2]]
     Export:
       Name: !Sub '${AWS::StackName}-IsolatedSubnetIds'
+
+  WebTierSecurityGroupId:
+    Description: Attach this security group to web-tier instances allowed to call the app endpoint.
+    Value: !GetAtt WebTierSecurityGroup.GroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-WebTierSecurityGroupId'
+
+  AppInternalLoadBalancerDnsName:
+    Description: Internal ALB DNS name; reachable from within the VPC by the web tier.
+    Value: !GetAtt InternalAppLoadBalancer.DNSName
+
+  AppInternalLoadBalancerEndpoint:
+    Description: Private HTTP endpoint used by the web tier to reach the JSON demo application.
+    Value: !Sub 'http://${InternalAppLoadBalancer.DNSName}:${AppPort}'
+
+  AppInstanceSecurityGroupId:
+    Description: Security group attached to app instances; ingress is allowed only from the internal ALB.
+    Value: !GetAtt AppInstanceSecurityGroup.GroupId
+
+  AppAutoScalingGroupName:
+    Description: Name of the application Auto Scaling Group.
+    Value: !Ref AppAutoScalingGroup
+
+  AppPort:
+    Description: TCP port used by the private demo application.
+    Value: !Ref AppPort
+
+  WebLoadBalancerDnsName:
+    Description: Public DNS name of the internet-facing web load balancer.
+    Value: !GetAtt WebLoadBalancer.DNSName
+
+  WebApplicationURL:
+    Description: Public HTTP URL for the three-tier demo application.
+    Value: !Sub 'http://${WebLoadBalancer.DNSName}'
+
+  WebAutoScalingGroupName:
+    Description: Name of the web-tier Auto Scaling Group.
+    Value: !Ref WebAutoScalingGroup
+
+  DatabaseEndpointAddress:
+    Description: Private DNS endpoint of the RDS MySQL database.
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+
+  DatabaseEndpointPort:
+    Description: MySQL port for the private RDS database.
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+
+  DatabaseName:
+    Description: Initial database name created in MySQL.
+    Value: !Ref DbName
+
+  DatabaseSecurityGroupId:
+    Description: Security group protecting the private database.
+    Value: !GetAtt DatabaseSecurityGroup.GroupId
+
   NatMode:
     Description: Selected NAT gateway architecture.
     Value: !Ref NatGatewayMode
